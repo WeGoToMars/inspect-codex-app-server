@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inspect-codex-app-server"
+version = "2026.10.29"
+description = "Run native Codex app-server sessions in Inspect AI"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["inspect-ai==0.3.286", "aiohttp>=3.9", "anyio>=4", "pydantic>=2", "shortuuid>=1", "typing-extensions>=4.12"]
+
+[project.entry-points.inspect_ai]
+inspect_codex_app_server = "inspect_codex_app_server"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.9", "ty==0.0.92", "datamodel-code-generator==0.86.0", "packaging>=24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--strict-markers -m 'not containers'"
+markers = [
+    "native: real pinned Codex executable; model responses supplied locally",
+    "containers: real Docker acceptance with the pinned Codex bundle",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ty.src]
+include = ["src", "scripts"]
+
+[tool.ty.terminal]
+error-on-warning = true
