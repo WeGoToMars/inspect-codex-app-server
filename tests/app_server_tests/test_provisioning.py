@@ -228,16 +228,18 @@ def test_calendar_versions_increase_within_a_day_and_reset_on_the_next(dependenc
         next_version(next_day, date(2026, 10, 28))
 
 
-@pytest.mark.parametrize("dependency", ["inspect", "codex"])
+@pytest.mark.parametrize("trigger", ["inspect", "codex", "manual"])
 def test_release_artifacts_identify_the_tested_dependency_pair(
-    tmp_path, monkeypatch, dependency_updater, dependency,
+    tmp_path, monkeypatch, dependency_updater, trigger,
 ):
-    """An update to either dependency must publish both pins without stale descriptions."""
+    """Dependency updates and manual releases must publish the exact tested pair."""
     import re
     import runpy
     import shutil
     import sys
     import tomllib
+
+    from packaging.version import Version
 
     source = Path(__file__).resolve().parents[2]
     package = tmp_path / "package"
@@ -251,20 +253,22 @@ def test_release_artifacts_identify_the_tested_dependency_pair(
     old_inspect, = [d.removeprefix("inspect-ai==") for d in manifest["dependencies"] if d.startswith("inspect-ai==")]
     expected = {"inspect": old_inspect, "codex": container.PINNED_CODEX_VERSION}
     # A newer stable registry version; no candidate binary is downloaded here.
-    expected[dependency] = "999.0.0"
-    commit = "2" * 40 if dependency == "codex" else container.PINNED_CODEX_SOURCE_COMMIT
+    if trigger != "manual":
+        expected[trigger] = "999.0.0"
+    commit = "2" * 40 if trigger == "codex" else container.PINNED_CODEX_SOURCE_COMMIT
     main = dependency_updater["main"]
     monkeypatch.setitem(main.__globals__, "PACKAGE", package)
     monkeypatch.setitem(main.__globals__, "latest_versions", lambda: (expected["inspect"], expected["codex"]))
     monkeypatch.setitem(main.__globals__, "codex_source_commit", lambda version: "2" * 40)
     output = tmp_path / "candidate"
     argv = ["update_dependencies.py", "--output-dir", str(output)]
+    release_argv = [*argv, "--release"] if trigger == "manual" else argv
     before = {relative: (package / relative).read_bytes() for relative in files}
-    monkeypatch.setattr(sys, "argv", [*argv, "--dry-run"])
+    monkeypatch.setattr(sys, "argv", [*release_argv, "--dry-run"])
     main()
     assert {relative: (package / relative).read_bytes() for relative in files} == before
 
-    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys, "argv", release_argv)
     main()
     plan = json.loads((output / "candidate.json").read_text())
     project = tomllib.loads((package / "pyproject.toml").read_text())["project"]
@@ -274,6 +278,7 @@ def test_release_artifacts_identify_the_tested_dependency_pair(
     assert f"inspect-ai=={expected['inspect']}" in project["dependencies"]
     assert native["PINNED_CODEX_VERSION"] == expected["codex"]
     assert native["PINNED_CODEX_SOURCE_COMMIT"] == plan["codex_source_commit"] == commit
+    assert Version(project["version"]) > Version(manifest["version"])
     assert plan["tag"] == f"v{project['version']}"
     description = (output / "notes.md").read_text()
     assert expected["inspect"] in description
@@ -286,6 +291,7 @@ def test_release_artifacts_identify_the_tested_dependency_pair(
     # Repeated or stale registry results must not change pins or create another release.
     released = {relative: (package / relative).read_bytes() for relative in files}
     monkeypatch.setitem(main.__globals__, "latest_versions", lambda: (old_inspect, container.PINNED_CODEX_VERSION))
+    monkeypatch.setattr(sys, "argv", argv)
     main()
     assert json.loads((output / "candidate.json").read_text())["changed"] is False
     assert {relative: (package / relative).read_bytes() for relative in files} == released

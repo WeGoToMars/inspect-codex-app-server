@@ -4,9 +4,11 @@ The [Compatibility and releases workflow](../.github/workflows/ci.yml) monitors 
 
 In addition to running on every push and pull request, upstream dependency checks run automatically every hour (at minute 17 UTC). You can also trigger them manually from the Actions tab or via an `upstream-release` repository dispatch event.
 
+To publish a release now, select **Run workflow** on the default branch and check **Publish a release even if dependency versions are unchanged**. This increments the calendar version and runs the same validation and publication steps as a dependency update.
+
 ## Candidate selection and validation
 
-When checking for updates, the workflow queries PyPI for the latest stable (non-yanked) Inspect release and npm for the latest stable Codex release. For Codex, the workflow also verifies that the release corresponds to a published stable GitHub release with a valid commit SHA. Version pins are never downgraded, and if neither dependency has changed, the workflow exits without creating a release.
+When checking for updates, the workflow queries PyPI for the latest stable (non-yanked) Inspect release and npm for the latest stable Codex release. For Codex, the workflow also verifies that the release corresponds to a published stable GitHub release with a valid commit SHA. Version pins are never downgraded. If neither dependency has changed, the workflow exits without creating a release unless manual publication was requested.
 
 When a newer stable version is found, the workflow constructs a candidate release:
 

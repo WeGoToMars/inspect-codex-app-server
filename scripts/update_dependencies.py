@@ -1,4 +1,4 @@
-"""Prepare a compatibility release for newer stable Inspect or Codex versions.
+"""Prepare a compatibility release for updated dependencies or manual publication.
 
 The workflow owns locking, protocol generation, tests, and publication. This
 script only discovers releases and updates the package metadata and native pin.
@@ -89,7 +89,7 @@ def next_calendar_version(current: str, release_date: date) -> str:
 
 
 def prepare_update(
-    package: Path, inspect: str, codex: str, *, dry_run: bool = False
+    package: Path, inspect: str, codex: str, *, dry_run: bool = False, release: bool = False
 ) -> dict[str, Any]:
     manifest_path = package / "pyproject.toml"
     manifest_text = manifest_path.read_text()
@@ -102,7 +102,7 @@ def prepare_update(
     old_commit, = re.findall(r'^PINNED_CODEX_SOURCE_COMMIT = "([0-9a-f]{40})"$', container, re.MULTILINE)
     inspect = str(max(stable_version(inspect), stable_version(old_inspect)))
     codex = str(max(stable_version(codex), stable_version(old_codex)))
-    changed = (inspect, codex) != (old_inspect, old_codex)
+    changed = release or (inspect, codex) != (old_inspect, old_codex)
     next_version = (
         next_calendar_version(manifest["version"], datetime.now(timezone.utc).date())
         if changed else manifest["version"]
@@ -155,10 +155,11 @@ def release_notes(plan: dict[str, Any]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Report the candidate without editing tracked files")
+    parser.add_argument("--release", action="store_true", help="Prepare a new release even when dependency pins are unchanged")
     parser.add_argument("--output-dir", type=Path, help="Write release metadata and notes for subsequent workflow jobs")
     args = parser.parse_args()
     inspect, codex = latest_versions()
-    plan = prepare_update(PACKAGE, inspect, codex, dry_run=args.dry_run)
+    plan = prepare_update(PACKAGE, inspect, codex, dry_run=args.dry_run, release=args.release)
     print(json.dumps(plan, indent=2))
     if args.output_dir:
         args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a release even if dependency versions are unchanged
+        type: boolean
+        default: false
   repository_dispatch:
     types: [upstream-release]
 
@@ -36,7 +41,7 @@ jobs:
           python-version: '3.13'
       - name: Install locked development dependencies
         run: uv sync --locked --group dev
-      - name: Discover and prepare newer stable dependencies
+      - name: Prepare dependency updates or a requested release
         id: candidate
         if: >-
           github.ref_name == github.event.repository.default_branch &&
@@ -44,7 +49,13 @@ jobs:
           github.event_name == 'repository_dispatch')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uv run --no-sync python scripts/update_dependencies.py --output-dir "$RUNNER_TEMP/release"
+          RELEASE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        run: |
+          release_args=()
+          if test "$RELEASE_REQUESTED" = true; then
+            release_args+=(--release)
+          fi
+          uv run --no-sync python scripts/update_dependencies.py --output-dir "$RUNNER_TEMP/release" "${release_args[@]}"
       - name: Lock candidate dependencies and regenerate the native protocol
         if: steps.candidate.outputs.changed == 'true'
         run: |
