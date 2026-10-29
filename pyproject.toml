@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inspect-codex-app-server"
-version = "2026.10.29"
+version = "2026.10.29.1"
 description = "Run native Codex app-server sessions in Inspect AI"
 readme = "README.md"
 license = "MIT"

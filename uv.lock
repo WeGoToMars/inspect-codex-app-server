@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform != 'emscripten'",
@@ -956,7 +956,7 @@ wheels = [
 
 [[package]]
 name = "inspect-codex-app-server"
-version = "2026.10.29"
+version = "2026.10.29.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
