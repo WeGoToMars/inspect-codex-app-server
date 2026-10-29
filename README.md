@@ -24,7 +24,7 @@ Codex manages inference, tool execution, and subagent orchestration, while Inspe
 - Node.js and npm when a compatible pinned Codex bundle is unavailable.
 
 For an npm-equipped container image, preinstall with
-`RUN npm install -g --prefix /opt/codex @openai/codex@0.165.0` and add
+`RUN npm install -g --prefix /opt/codex @openai/codex@0.166.0` and add
 `/opt/codex/bin` to `PATH`. See [provisioning constraints](docs/technical-notes.md#provisioning-and-authentication).
 
 Install the package:

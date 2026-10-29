@@ -34,8 +34,8 @@ DEFAULT_CONFIG_TOML = (
 )
 IN_CONTAINER_BIN = "/usr/local/bin/codex"
 IN_CONTAINER_CODE_MODE_HOST = "/usr/local/bin/codex-code-mode-host"
-PINNED_CODEX_VERSION = "0.165.0"
-PINNED_CODEX_SOURCE_COMMIT = "360319d8dee62d87e2d59fc0c21805d79519cfed"
+PINNED_CODEX_VERSION = "0.166.0"
+PINNED_CODEX_SOURCE_COMMIT = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
 REQUIRED_CLI_VERSION = f"codex-cli {PINNED_CODEX_VERSION}"
 # Timeouts for background npm installation and executable version probes.
 CODEX_INSTALL_TIMEOUT_SEC = 300.0
