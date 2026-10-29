@@ -155,7 +155,7 @@ jobs:
               gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release/dist/* --clobber
             fi
           else
-            options=(--verify-tag --draft --title "inspect-codex-app-server $RELEASE_VERSION" --notes-file "$RUNNER_TEMP/release/notes.md")
+            options=(--verify-tag --draft --title "$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/release/notes.md")
             if test "$PRERELEASE" = true; then
               options+=(--prerelease)
             fi
