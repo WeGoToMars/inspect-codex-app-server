@@ -427,3 +427,24 @@ def test_native_evidence_redacts_account_rpc_fields_and_retains_full_content(tmp
     assert rows[5]["message"]["params"]["input"][0]["text"] == prompt
     manifest = json.loads((evidence.directory / "manifest.json").read_text())
     assert manifest["closed"] and not manifest["truncated"] and manifest["events"] == 6
+
+
+def test_late_response_usage_preserves_its_observed_serving_model(usage_contexts, captured_events):
+    mapper = make_mapper(make_state(), model_name="configured")
+    mapper.on_turn_started("turn/started", {"threadId": "root", "turn": {"id": "t1"}})
+    mapper.on_model_rerouted("model/rerouted", {
+        "threadId": "root", "turnId": "t1", "fromModel": "configured",
+        "toModel": "safety", "reason": "highRiskCyberActivity",
+    })
+    response = {"threadId": "root", "responseId": "r1"}
+    mapper.on_response_completed("rawResponse/completed", response)
+    mapper.on_turn_started("turn/started", {"threadId": "root", "turn": {"id": "t2"}})
+    recovered = {**response, "usage": {"inputTokens": 20, "outputTokens": 5, "totalTokens": 25}}
+    mapper.on_response_completed("rollout/token_usage_record", recovered)
+    mapper.on_response_completed("rollout/token_usage_record", recovered)
+    record = mapper.responses[("root", "r1")]
+    assert record["servingModel"] == "safety"
+    assert record["modelAttribution"] == "model-rerouted"
+    for context in usage_contexts:
+        assert context.get()["safety"].total_tokens == 25
+        assert sum(value.total_tokens for value in context.get().values()) == 25

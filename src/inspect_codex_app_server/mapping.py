@@ -638,12 +638,16 @@ class EventStreamMapper:
                 if self.state and self.state.messages:
                     for m in reversed(self.state.messages):
                         if m.role == "user" and (m.text or "").strip() == last_user_text:
-                            m.content = text
+                            m.content = ([ContentText(text=text), *[
+                                block for block in m.content if not isinstance(block, ContentText)
+                            ]] if isinstance(m.content, list) else text)
                             break
                 if self.messages:
                     for m in reversed(self.messages):
                         if m.role == "user" and (m.text or "").strip() == last_user_text:
-                            m.content = text
+                            m.content = ([ContentText(text=text), *[
+                                block for block in m.content if not isinstance(block, ContentText)
+                            ]] if isinstance(m.content, list) else text)
                             break
                 return
 
@@ -1182,7 +1186,7 @@ class EventStreamMapper:
     def _drain_root_pending(self) -> list[ContentReasoning | ContentText]:
         return self._drain_thread_pending(self.root_thread_id)
 
-    def _meter_thread(self, thread_id: str | None) -> None:
+    def _meter_thread(self, thread_id: str | None, *, model: str | None = None) -> None:
         usage = self._thread_usage(thread_id)
         native = usage.last_reported_total or ModelUsage()
         calls = usage.response_total
@@ -1190,7 +1194,7 @@ class EventStreamMapper:
         candidate = _usage_envelope(native, calls)
         delta = _usage_delta(candidate, usage.running_total)
         _usage_add(usage.running_total, delta)
-        compat.record_usage(self._thread_model(thread_id), delta)
+        compat.record_usage(model or self._thread_model(thread_id), delta)
         if not self.tearing_down:
             compat.record_limit_usage(delta)
             compat.check_limits()
@@ -1207,6 +1211,11 @@ class EventStreamMapper:
                        "unobserved" if model == "codex/unknown" else "thread-configuration")
         record = dict(params, configuredModel=self._configured_model(thread_id), modelAttribution=attribution,
                       inputRepresentation="unobserved", servingModel=model if rerouted else "unobserved")
+        if prior is not None:
+            for field in ("configuredModel", "modelAttribution", "inputRepresentation", "servingModel"):
+                record[field] = prior[field]
+            model = (record["servingModel"] if record["servingModel"] != "unobserved"
+                     else record["configuredModel"])
         self.responses[key] = record
         usage = params.get("usage")
         if usage is not None:
@@ -1215,7 +1224,7 @@ class EventStreamMapper:
                 # Record usage before limit checks can trigger.
                 compat.record_response_usage(model, model_usage)
             _usage_add(self._thread_usage(thread_id).response_total, model_usage)
-            self._meter_thread(thread_id)
+            self._meter_thread(thread_id, model=model)
             active_event = self._active_model_events.get(thread_id)
             if active_event is not None and active_event.output is not None:
                 if active_event.output.usage is None:

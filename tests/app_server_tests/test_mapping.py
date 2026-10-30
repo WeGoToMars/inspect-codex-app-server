@@ -281,12 +281,16 @@ def test_user_messages_preserve_new_input_without_echo_duplicates(captured_event
     assert [m.text for m in state.messages] == ["Initial prompt", "Next instruction"]
     assert [e.input for e in captured_events if e.event == "input"] == ["Next instruction"]
 
-    # Native prompt augmentation updates the existing message, retaining its identity.
+    # Native prompt augmentation retains media as well as message identity.
+    from inspect_ai.model import ContentImage, ContentText
+    image = ContentImage(image="data:image/png;base64,aW1hZ2U=")
+    state.messages[-1].content = [ContentText(text="Next instruction"), image]
     mapper.on_item_completed("item/completed", completed_item("root", {
         "type": "userMessage", "id": "augmented", "content": [
             {"type": "text", "text": "Context\n\nNext instruction"}],
     }))
     assert [m.text for m in state.messages] == ["Initial prompt", "Context\n\nNext instruction"]
+    assert image in state.messages[-1].content
 
 
 def test_user_message_in_subagent_is_mapped(captured_events):

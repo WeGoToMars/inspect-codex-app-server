@@ -404,3 +404,50 @@ def test_exhausted_quota_hold_is_an_error_without_retry(tmp_path, monkeypatch):
     hold, = sample.metadata["codex_quota_holds"]
     assert hold["outcome"] == "exhausted" and hold["held_sec"] >= 0.5
     assert sum(method == "turn/start" for method, _ in peer.requests) == 1
+
+
+@pytest.mark.parametrize("reads,outcome", [
+    ([{"ordinaryUsageAllowed": True}], "usage_allowed"),
+    ([{"rateLimits": {"primary": {"usedPercent": 100}}},
+      {"rateLimits": {"primary": {"usedPercent": 0}}}], "windows_available"),
+])
+def test_quota_recovery_accepts_initial_permission_and_reset_windows(tmp_path, monkeypatch, reads, outcome):
+    peer = QuotaPeer(reads)
+    sample = run_evaluation(tmp_path, monkeypatch, peer, policy=RunPolicy(
+        quota_hold_sec=1, quota_poll_sec=0.05, continuation="Resume.",
+    ))
+    assert sample.error is None
+    assert sample.output.completion == "42"
+    assert sample.metadata["codex_quota_holds"][0]["outcome"] == outcome
+
+
+def test_quota_probe_wait_is_excluded_from_short_remaining_budget(tmp_path, monkeypatch):
+    from inspect_codex_app_server.runtime.budget import BudgetTracker
+
+    peer = QuotaPeer([{"ordinaryUsageAllowed": True}])
+    original = peer.write_line
+
+    async def slow_probe(line):
+        message = json.loads(line)
+        if message.get("method") == "account/rateLimits/read":
+            await asyncio.sleep(0.15)
+        await original(line)
+
+    peer.write_line = slow_probe
+    # Enter the actual quota hold with less working time than its RPC latency.
+    from inspect_codex_app_server.session import CodexSession
+    original_hold = CodexSession._quota_hold
+
+    async def near_deadline(self, detail):
+        self.budget = BudgetTracker(0.08)
+        self._reschedule_deadline()
+        return await original_hold(self, detail)
+
+    monkeypatch.setattr(CodexSession, "_quota_hold", near_deadline)
+    sample = run_evaluation(tmp_path, monkeypatch, peer, policy=RunPolicy(
+        quota_hold_sec=1, quota_poll_sec=0.1, continuation="Resume.",
+    ))
+    assert sample.error is None
+    assert sample.limit is None
+    assert sample.output.completion == "42"
+    assert sample.metadata["codex_quota_holds"][0]["held_sec"] >= 0.15

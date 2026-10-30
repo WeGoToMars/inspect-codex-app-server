@@ -84,7 +84,7 @@ policy = RunPolicy(
 The policy configures three primary behaviors:
 
 - **Completion mode**: `"turn"` finishes after the first successful root turn using its final answer. `"goal"` allows the agent to continue across turns until the native goal completes, with an optional `terminal_nudge` to prompt for a final answer before an unsuccessful exit. `"submission"` requires an authoritative `receipt_reader` to extract the final answer from an item or tool output.
-- **Quota holds**: When Codex raises `usageLimitExceeded`, `quota_hold_sec` defines how long the adapter will pause and wait while polling `account/rateLimits/read` every `quota_poll_sec`. Time spent waiting is credited back to the run's time budget. If the overall run deadline expires during a hold, the run exits cleanly.
+- **Quota holds**: When Codex raises `usageLimitExceeded`, `quota_hold_sec` defines how long the adapter will pause and wait while polling `account/rateLimits/read` every `quota_poll_sec`. Time spent waiting, including status RPCs, is credited back to the run's time budget. The initial status is evaluated immediately; restored capacity can also be observed through non-exhausted windows when the optional usage-permission field is absent. Quota waiting has its own bounded deadline. If the overall run deadline expires during a hold, the run exits cleanly.
 - **Steering reminders**: `checkpoint_fractions` schedules prompt injections at specific fractions of the time limit (for example, at 50% and 80%) to warn the agent about its remaining budget and prompt it to wrap up. These runtime reminders are purely conversational and are distinct from Inspect's persisted disk checkpoints.
 
 ## Operator interruption and checkpoint resume

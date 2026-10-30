@@ -185,7 +185,7 @@ def _classify_turn_error(turn: dict[str, Any]) -> tuple[str, bool]:
     return "turn_failure", transient
 
 
-def _usage_recovery(limits: dict[str, Any], baseline: dict[str, Any], now: float) -> str | None:
+def _usage_recovery(limits: dict[str, Any], baseline: dict[str, Any]) -> str | None:
     """Determine if rate limit indicators suggest usage can resume."""
 
     def snapshots(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -203,15 +203,12 @@ def _usage_recovery(limits: dict[str, Any], baseline: dict[str, Any], now: float
     if has_credits(limits) and not has_credits(baseline):
         return "credits_added"
     if allowed is None:
-        # If ordinaryUsageAllowed is not explicit, check whether exhausted rate limit windows have reset.
-        resets = [
-            w.get("resetsAt")
-            for s in snapshots(limits)
-            for w in (s.get("primary"), s.get("secondary"))
-            if isinstance(w, dict) and w.get("usedPercent", 0) >= 100
-        ]
-        if resets and all(isinstance(r, int) and r <= now for r in resets):
-            return "windows_reset"
+        windows = [w for snapshot in snapshots(limits)
+                   for w in (snapshot.get("primary"), snapshot.get("secondary"))
+                   if isinstance(w, dict)]
+        if windows and all(isinstance(w.get("usedPercent"), (int, float))
+                           and w["usedPercent"] < 100 for w in windows):
+            return "windows_available"
     return None
 
 
@@ -1460,7 +1457,6 @@ class CodexSession:
             self.budget.hold(now - last)
             hold["held_sec"] += now - last
             last = now
-            self._reschedule_deadline()
 
         async def read_limits() -> dict[str, Any] | None:
             try:
@@ -1471,40 +1467,49 @@ class CodexSession:
                 hold["probe_errors"].append(f"{exc.code}: {exc.message}")
                 return None
 
+        self.execution_timeout.reschedule(None)
         try:
-            try:
-                baseline = await read_limits() or {}
-            except JsonRpcError:
-                hold["outcome"] = "unobservable"
-                return False
-            hold["rate_limits"] = baseline
-            next_probe = loop.time() + self.config.policy.quota_poll_sec
-            while self.budget.held_sec < self.config.policy.quota_hold_sec:
-                await asyncio.sleep(
-                    max(
-                        0.0,
-                        min(
-                            QUOTA_CREDIT_SEC,
-                            next_probe - loop.time(),
-                            self.config.policy.quota_hold_sec - self.budget.held_sec,
-                        ),
-                    )
-                )
-                credit()
-                self.client.raise_if_failed()
-                if loop.time() < next_probe:
-                    continue
-                limits = await read_limits()
+            async with asyncio.timeout(self.config.policy.quota_hold_sec - self.budget.held_sec):
+                try:
+                    baseline = await read_limits() or {}
+                except JsonRpcError:
+                    hold["outcome"] = "unobservable"
+                    return False
+                hold["rate_limits"] = baseline
+                outcome = _usage_recovery(baseline, baseline)
+                if outcome:
+                    hold["outcome"] = outcome
+                    return True
                 next_probe = loop.time() + self.config.policy.quota_poll_sec
-                if limits is not None:
-                    hold["rate_limits"] = limits
-                    outcome = _usage_recovery(limits, baseline, time.time())
-                    if outcome:
-                        hold["outcome"] = outcome
-                        return True
+                while self.budget.held_sec < self.config.policy.quota_hold_sec:
+                    await asyncio.sleep(
+                        max(
+                            0.0,
+                            min(
+                                QUOTA_CREDIT_SEC,
+                                next_probe - loop.time(),
+                                self.config.policy.quota_hold_sec - self.budget.held_sec,
+                            ),
+                        )
+                    )
+                    credit()
+                    self.client.raise_if_failed()
+                    if loop.time() < next_probe:
+                        continue
+                    limits = await read_limits()
+                    next_probe = loop.time() + self.config.policy.quota_poll_sec
+                    if limits is not None:
+                        hold["rate_limits"] = limits
+                        outcome = _usage_recovery(limits, baseline)
+                        if outcome:
+                            hold["outcome"] = outcome
+                            return True
+                return False
+        except TimeoutError:
             return False
         finally:
             credit()
+            self._reschedule_deadline()
             compat.emit_event(
                 InfoEvent(source="codex-quota-hold", data={"phase": "ended", **hold}, span_id=self.root_agent_span_id)
             )
