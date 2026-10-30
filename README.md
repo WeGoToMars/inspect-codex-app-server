@@ -1,8 +1,8 @@
 # inspect-codex-app-server
 
-An [Inspect AI](https://inspect.aisi.org.uk/) solver and agent that run native Codex sessions inside Docker sandboxes via the Codex App Server JSON-RPC protocol.
+An [Inspect](https://inspect.aisi.org.uk/) solver and agent that run native Codex sessions inside Docker sandboxes via the Codex App Server JSON-RPC protocol.
 
-Codex manages inference, tool execution, and subagent orchestration, while Inspect AI manages evaluation, scoring, tool governance, and token, message, and time limits. Cost and model-generation turn limits are unsupported.
+Codex manages inference, tool execution, and subagent orchestration, while Inspect AI manages evaluation, scoring, tool governance, and token, message, and time limits.
 
 ## Key Features
 
@@ -165,9 +165,9 @@ uv run python scripts/generate_protocol.py --check
 
 ## Automated compatibility releases
 
-The [workflow](.github/workflows/ci.yml) checks pushes and pull requests, and can
-check upstream releases hourly and publish passing candidates to GitHub and
-PyPI. See [release setup, publication, and retry notes](docs/releases.md).
+The [test workflow](.github/workflows/test.yml) checks pushes and pull requests, while
+the [release workflow](.github/workflows/release.yml) checks upstream releases hourly
+and publishes passing candidates to GitHub and PyPI. See [release setup, publication, and retry notes](docs/releases.md).
 
 ## License
 

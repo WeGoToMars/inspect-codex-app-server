@@ -1,8 +1,8 @@
 # Automated compatibility releases
 
-The [Compatibility and releases workflow](../.github/workflows/ci.yml) monitors upstream releases of Inspect AI and OpenAI Codex, verifies compatibility against the test suite, and automatically publishes updated packages to PyPI and GitHub Releases.
+The [Compatibility and releases workflow](../.github/workflows/release.yml) monitors upstream releases of Inspect AI and OpenAI Codex, verifies compatibility against the test suite, and automatically publishes updated packages to PyPI and GitHub Releases.
 
-In addition to running on every push and pull request, upstream dependency checks run automatically every hour (at minute 17 UTC). You can also trigger them manually from the Actions tab or via an `upstream-release` repository dispatch event.
+Upstream dependency checks run automatically every hour (at minute 17 UTC). Continuous integration checks on pushes and pull requests are managed separately by the [test workflow](../.github/workflows/test.yml). You can also trigger dependency checks manually from the Actions tab or via an `upstream-release` repository dispatch event.
 
 To publish a release now, select **Run workflow** on the default branch and check **Publish a release even if dependency versions are unchanged**. This increments the calendar version and runs the same validation and publication steps as a dependency update.
 
@@ -36,7 +36,7 @@ The candidate version is assigned before validation and building. Once all check
 To enable automated releases in your fork or repository:
 
 - **GitHub Actions permissions**: Ensure GitHub Actions is enabled and that branch protection rules on your default branch permit the Actions bot to push release commits and create tags.
-- **PyPI Trusted Publishing**: Set up a [PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/using-a-publisher/) for `inspect-codex-app-server` configured with your repository name, workflow filename `ci.yml`, and environment name `pypi`. Because the workflow authenticates via OIDC, no hardcoded API tokens or secrets are required. For unattended releases, configure the GitHub `pypi` environment to allow deployments without manual approval.
+- **PyPI Trusted Publishing**: Set up a [PyPI Trusted Publisher](https://docs.pypi.org/trusted-publishers/using-a-publisher/) for `inspect-codex-app-server` configured with your repository name, workflow filename `release.yml`, and environment name `pypi`. Because the workflow authenticates via OIDC, no hardcoded API tokens or secrets are required. For unattended releases, configure the GitHub `pypi` environment to allow deployments without manual approval.
 
 ## Retries and local inspection
 

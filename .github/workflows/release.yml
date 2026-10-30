@@ -1,8 +1,6 @@
-name: Compatibility and releases
+name: Package version upgrader
 
 on:
-  push:
-  pull_request:
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
@@ -23,8 +21,8 @@ concurrency:
 
 jobs:
   check:
-    name: Check pinned or candidate dependencies
-    runs-on: ubuntu-24.04
+    name: Check latest Codex and Inspect AI versions
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     outputs:
       changed: ${{ steps.candidate.outputs.changed }}
@@ -33,20 +31,22 @@ jobs:
       prerelease: ${{ steps.candidate.outputs.prerelease }}
       base_sha: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository source code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Set up Python 3.13 and uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: '3.13'
-      - name: Install locked development dependencies
+
+      - name: Install locked development dependencies with uv
         run: uv sync --locked --group dev
-      - name: Prepare dependency updates or a requested release
+
+      - name: Check upstream dependency releases and prepare candidate updates
         id: candidate
-        if: >-
-          github.ref_name == github.event.repository.default_branch &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
-          github.event_name == 'repository_dispatch')
+        if: github.ref_name == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
@@ -56,34 +56,42 @@ jobs:
             release_args+=(--release)
           fi
           uv run --no-sync python scripts/update_dependencies.py --output-dir "$RUNNER_TEMP/release" "${release_args[@]}"
-      - name: Lock candidate dependencies and regenerate the native protocol
+
+      - name: Update uv.lock and regenerate native Codex JSON-RPC protocol bindings
         if: steps.candidate.outputs.changed == 'true'
         run: |
           uv lock
           uv sync --locked --group dev
           uv run --no-sync python scripts/generate_protocol.py
-      - name: Check protocol, lint, and types
-        if: steps.candidate.outputs.changed == 'true' || steps.candidate.outcome == 'skipped'
+
+      - name: Run protocol consistency check, Ruff linter, and ty type checker
+        if: steps.candidate.outputs.changed == 'true'
         run: |
           uv run --no-sync python scripts/generate_protocol.py --check
           uv run --no-sync ruff check .
           uv run --no-sync ty check
-      - name: Default tests, including the real pinned Codex executable
-        if: steps.candidate.outputs.changed == 'true' || steps.candidate.outcome == 'skipped'
+
+      - name: Run default test suite with real pinned Codex executable
+        if: steps.candidate.outputs.changed == 'true'
         run: uv run --no-sync pytest -q --keep-failed-artifacts="$RUNNER_TEMP/failures" --junitxml="$RUNNER_TEMP/default.xml"
-      - name: Prepare Docker acceptance
-        if: steps.candidate.outputs.changed == 'true' || steps.candidate.outcome == 'skipped'
+
+      - name: Pull python:3.13-slim base Docker image for container tests
+        if: steps.candidate.outputs.changed == 'true'
         run: docker pull python:3.13-slim
-      - name: Docker acceptance
-        if: steps.candidate.outputs.changed == 'true' || steps.candidate.outcome == 'skipped'
+
+      - name: Run container acceptance tests in Docker sandboxes
+        if: steps.candidate.outputs.changed == 'true'
         run: uv run --no-sync pytest -q -m containers --keep-failed-artifacts="$RUNNER_TEMP/failures" --junitxml="$RUNNER_TEMP/containers.xml"
-      - name: Build wheel and source archive
-        if: steps.candidate.outputs.changed == 'true' || steps.candidate.outcome == 'skipped'
+
+      - name: Build wheel and source distribution packages with uv
+        if: steps.candidate.outputs.changed == 'true'
         run: uv build --no-sources --out-dir "$RUNNER_TEMP/release/dist"
-      - name: Save candidate source changes for review or publication
+
+      - name: Generate candidate source git diff patch for release
         if: always() && steps.candidate.outputs.changed == 'true'
         run: git diff --binary > "$RUNNER_TEMP/release/candidate.patch"
-      - name: Retain passing release candidate
+
+      - name: Upload verified release candidate artifacts
         if: steps.candidate.outputs.changed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -91,7 +99,8 @@ jobs:
           path: ${{ runner.temp }}/release
           if-no-files-found: error
           retention-days: 14
-      - name: Retain failure diagnostics and candidate changes
+
+      - name: Upload test failure diagnostics, JUnit reports, and candidate artifacts
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -108,20 +117,24 @@ jobs:
     name: Record tested pins and draft the GitHub release
     needs: check
     if: needs.check.outputs.changed == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository at tested base commit with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.check.outputs.base_sha }}
           fetch-depth: 0
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+
+      - name: Download verified release candidate artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: release-candidate
           path: ${{ runner.temp }}/release
-      - name: Commit and tag exactly the tested source
+
+      - name: Apply candidate patch, create release commit and tag, and push to origin
         env:
           RELEASE_VERSION: ${{ needs.check.outputs.version }}
           RELEASE_TAG: ${{ needs.check.outputs.tag }}
@@ -142,7 +155,8 @@ jobs:
             # A concurrent default-branch change rejects the entire push.
             git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/$RELEASE_TAG"
           fi
-      - name: Attach the tested distributions to a draft release
+
+      - name: Create or update draft GitHub release and attach distribution packages
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -165,17 +179,20 @@ jobs:
   publish:
     name: Publish the tested distributions to PyPI
     needs: record
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - name: Download release candidate distribution packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: release-candidate
           path: candidate
-      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+
+      - name: Publish wheel and source distribution packages to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: candidate/dist
           skip-existing: true
@@ -183,12 +200,12 @@ jobs:
   release:
     name: Publish the GitHub release after PyPI succeeds
     needs: [check, publish]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: Publish the draft
+      - name: Publish draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
