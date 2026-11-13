@@ -29,8 +29,6 @@ DEFAULT_CONFIG_TOML = (
     'approvals_reviewer = "user"\n\n'
     "[shell_environment_policy]\n"
     'inherit = "all"\n\n'
-    "[features]\n"
-    "multi_agent = true\n\n"
 )
 IN_CONTAINER_BIN = "/usr/local/bin/codex"
 IN_CONTAINER_CODE_MODE_HOST = "/usr/local/bin/codex-code-mode-host"
