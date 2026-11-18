@@ -1,4 +1,4 @@
-# Generated from codex-cli 0.169.0; schema SHA-256: 552d119f75b62189f7ebf19d516fbf02e04b2c25e443ed8e8f96349025d936d2
+# Generated from codex-cli 0.170.0; schema SHA-256: 099ab15d608261f132523acf69fcd1db52bbcf76254fdeb58749d867c3937272
 # Generator: datamodel-code-generator 0.86.0
 # Regenerate with scripts/generate_protocol.py; do not edit.
 from __future__ import annotations
