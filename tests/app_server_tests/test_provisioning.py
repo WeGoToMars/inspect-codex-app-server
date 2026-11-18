@@ -186,6 +186,15 @@ async def test_image_with_the_pinned_release_keeps_it(tmp_path, monkeypatch, ima
 
 
 async def test_empty_selection_variables_select_nothing(stub_npm, monkeypatch):
+    # Exercise the npm fallback even when the host has the pinned Codex on PATH.
+    host_which = container.shutil.which
+
+    def which(command, *args, **kwargs):
+        if command == "codex":
+            return None
+        return host_which(command, *args, **kwargs)
+
+    monkeypatch.setattr(container.shutil, "which", which)
     monkeypatch.setenv("CODEX_PATH", "")
     monkeypatch.setenv("CODEX_AUTH_PATH", "")
     assert await container.find_host_codex() == await container.download_pinned_codex()
