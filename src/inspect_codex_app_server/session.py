@@ -91,6 +91,10 @@ INSPECT_APPROVAL_POLICY: Literal["untrusted"] = "untrusted"
 APPLIED_GENERATE_CONFIG = frozenset({"reasoning_effort", "reasoning_summary", "response_schema"})
 
 CONTINUATION_GRACE_SEC = 20.0
+# Native message for a stream that closed before response.completed (after its stream retries).
+STREAM_TRUNCATED = "stream disconnected before completion"
+# A subclass horizon can move earlier while the run waits; re-read the schedule at least this often.
+CHECKPOINT_RECHECK_SEC = 30.0
 
 # Inactivity threshold between turns before reporting a stalled session.
 STALL_TIMEOUT_SEC = 900.0
@@ -180,8 +184,14 @@ def _classify_turn_error(turn: dict[str, Any]) -> tuple[str, bool]:
         return "policy_block", False
     if tag in CONTEXT_LIMIT_ERRORS:
         return "context_limit", False
-    transient = tag in {"rateLimitExceeded", "flexUnavailable", "serverOverloaded", "internalServerError"}
-    transient = transient or status == 429 or (isinstance(status, int) and 500 <= status < 600)
+    if isinstance(status, int):
+        # A provider status decides: only rate limits and server errors pass.
+        return "turn_failure", status == 429 or 500 <= status < 600
+    # Codex has already retried connection failures and truncated streams.
+    message = str(error.get("message") or "")
+    transient = tag in {"rateLimitExceeded", "flexUnavailable", "serverOverloaded", "internalServerError",
+                        "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected"}
+    transient = transient or (tag == "other" and message.startswith(STREAM_TRUNCATED))
     return "turn_failure", transient
 
 
@@ -495,9 +505,12 @@ class CodexSession:
         self.normal_finish = False
         self.goal_ok = False
         self.pending_failure: CodexExecutionError | None = None
+        # Failed turns the turn loop already handled (and recovered from, or it raised).
+        self.failed_turns: set[str] = set()
 
     async def run(self) -> TaskState:
-        await self._provision()
+        if not await self._provision():
+            return self.state
         self._register_handlers()
         self.execution_timeout = asyncio.timeout(self.budget.remaining())
         try:
@@ -535,19 +548,28 @@ class CodexSession:
                     raise
             if self.normal_finish:
                 self.client.raise_if_failed()
-                last = (
-                    self.client.turn_data(self.thread_id, self.client.submitted_turn_id)
-                    if self.thread_id and self.client.submitted_turn_id
-                    else self.client.latest_turn_data(self.thread_id)
+                # The latest root turn, or the submitting turn, can fail after acceptance.
+                turns = (
+                    [self.client.latest_turn_data(self.thread_id),
+                     self.client.turn_data(self.thread_id, self.client.submitted_turn_id or "")]
                     if self.thread_id
-                    else None
+                    else []
                 )
-                if last and _turn_info(last).get("status") == "failed" and self.stop_reason is None:
-                    self.state.metadata["codex_partial_submission"] = self.state.output.completion
-                    kind, _ = _classify_turn_error(_turn_info(last))
-                    raise CodexExecutionError(kind, _format_turn_error(_turn_info(last)))
+                info = next((
+                    info for info in (_turn_info(turn) for turn in turns if turn)
+                    if info.get("status") == "failed" and info.get("id") not in self.failed_turns
+                ), {})
+                if info and self.stop_reason is None:
+                    if self.client.submitted_turn_id:
+                        # The accepted root submission stands; record the later failure.
+                        self.state.metadata["codex_failure_after_submission"] = _format_turn_error(info)
+                    else:
+                        self.state.metadata["codex_partial_submission"] = self.state.output.completion
+                        kind, _ = _classify_turn_error(info)
+                        raise CodexExecutionError(kind, _format_turn_error(info))
 
-    async def _provision(self) -> None:
+    async def _provision(self) -> bool:
+        """Provision the native session; False when no budget remains to run it."""
         compat.require_supported_budgets(self.state.cost_limit)
         compat.check_limits()
         # Resolve model name (strip provider prefix, keep None for server default)
@@ -562,11 +584,24 @@ class CodexSession:
         self.mapper.model_name = self.resolved_model or "codex"
 
         # Inspect's task-level limits also apply outside this native deadline.
-        self.budget = BudgetTracker(
+        self.budget = (self.config.policy.budget_factory or BudgetTracker)(
             self.config.timeout_sec,
             clock=asyncio.get_running_loop().time,
             checkpoints=self.config.policy.checkpoint_fractions,
         )
+        if self.resume_thread and self.checkpoint is not None:
+            # Continue the interrupted attempt's clock, quota allowance, and
+            # reminders, as Inspect's working limit continues its clock.
+            saved = self.checkpoint.session
+            self.budget.restore(
+                float(saved.get("elapsed_sec", 0.0)),
+                float(saved.get("held_sec", 0.0)),
+                saved.get("delivered_checkpoints", ()),
+            )
+        if self.budget.remaining() <= 0.0:
+            compat.emit_event(time_budget_depleted_event(self.config.timeout_sec, span_id=self.root_span_id))
+            compat.emit_event(InterruptEvent(source="limit", interrupted="between_turns", span_id=self.root_span_id))
+            return False
         self.env = sandbox(self.config.sandbox_name) if self.config.sandbox_name else sandbox()
 
         setup_timeout = asyncio.timeout(self.budget.remaining())
@@ -694,6 +729,7 @@ class CodexSession:
             auth_token=auth_token,
             receipt_reader=self.config.policy.receipt_reader,
         )
+        return True
 
     def _register_handlers(self) -> None:
         self.evidence = NativeEvidence(str(self.state.sample_id))
@@ -993,6 +1029,7 @@ class CodexSession:
             self.goal_ok = bool(self.checkpoint.session.get("goal_ok"))
             self.attempt_count = int(self.checkpoint.session.get("attempt_count", 0))
             self.refusal_retries = int(self.checkpoint.session.get("refusal_retries", 0))
+            self.pending_checkpoint = self.checkpoint.session.get("pending_checkpoint")
 
         self.best_effort_nudged = False
         self.last_activity: tuple[int, int] = (-1, -1)
@@ -1057,11 +1094,16 @@ class CodexSession:
                         self.turn_id = await self._start_turn(
                             [{"type": "text", "text": self.config.policy.continuation, "text_elements": []}]
                         )
+                        # The retry is working again: a deadline from here on is a time limit.
+                        self.pending_failure = None
                         continue
                     status = await self._goal_status()
                     if status is not None and status != "active":
                         if await self._finish_or_nudge(status, remaining_time):
                             break
+                        continue
+                    # A native continuation announced during the read runs (or fails) before any reminder.
+                    if await self._adopt_native_turn():
                         continue
                     due = self.budget.due_checkpoints()
                     if due and self.config.policy.checkpoint_message is not None:
@@ -1069,7 +1111,7 @@ class CodexSession:
                             {
                                 "type": "text",
                                 "text": self.config.policy.checkpoint_message(
-                                    due[-1], self.budget.elapsed(), self.config.timeout_sec
+                                    due[-1], self.budget.elapsed(), self.budget.horizon_sec
                                 ),
                                 "text_elements": [],
                             }
@@ -1089,7 +1131,8 @@ class CodexSession:
                                     else await self.client.wait_for_next_turn(
                                         self.thread_id,
                                         self.seen_turns,
-                                        min(CONTINUATION_GRACE_SEC, max(0.0, self.budget.remaining())),
+                                        min(CONTINUATION_GRACE_SEC, self.budget.until_next_checkpoint(),
+                                            CHECKPOINT_RECHECK_SEC),
                                     )
                                 )
                         except AgentInterrupted:
@@ -1112,10 +1155,7 @@ class CodexSession:
                                     break
                                 continue
                             # The status RPC itself can overlap a server start.
-                            server_turn = await self.client.wait_for_next_turn(self.thread_id, self.seen_turns, 0)
-                            if server_turn:
-                                self.seen_turns.add(server_turn)
-                                self.turn_id = server_turn
+                            if await self._adopt_native_turn():
                                 continue
                             if self.goal_ok and not self.last_turn_failed:
                                 # Wait for Codex to continue the active goal; detect stalls if no events arrive.
@@ -1138,7 +1178,7 @@ class CodexSession:
                     {
                         "type": "text",
                         "text": self.config.policy.checkpoint_message(
-                            due[-1], self.budget.elapsed(), self.config.timeout_sec
+                            due[-1], self.budget.elapsed(), self.budget.horizon_sec
                         ),
                         "text_elements": [],
                     }
@@ -1161,7 +1201,9 @@ class CodexSession:
                     completed_data = await self.client.wait_for_turn(
                         thread_id=self.thread_id,
                         turn_id=self.turn_id,
-                        timeout=max(0.01, min(self.budget.remaining(), self.budget.until_next_checkpoint())),
+                        timeout=max(0.01, min(
+                            self.budget.remaining(), self.budget.until_next_checkpoint(), CHECKPOINT_RECHECK_SEC
+                        )),
                     )
             except AgentInterrupted:
                 await self._operator_interrupt()
@@ -1223,6 +1265,7 @@ class CodexSession:
                 err_desc = _format_turn_error(turn_info)
                 kind, retryable = _classify_turn_error(turn_info)
                 self.pending_failure = CodexExecutionError(kind, err_desc)
+                self.failed_turns.add(turn_info.get("id") or "")
                 self.state.metadata.setdefault("codex_turn_failures", []).append(turn_info)
                 logger.warning(
                     "Codex turn failed (%d/%d): %s",
@@ -1514,6 +1557,14 @@ class CodexSession:
                 InfoEvent(source="codex-quota-hold", data={"phase": "ended", **hold}, span_id=self.root_agent_span_id)
             )
 
+    async def _adopt_native_turn(self) -> bool:
+        """Make an already announced, unseen native root turn the current turn."""
+        server_turn = await self.client.wait_for_next_turn(self.thread_id, self.seen_turns, 0)
+        if server_turn:
+            self.seen_turns.add(server_turn)
+            self.turn_id = server_turn
+        return bool(server_turn)
+
     def _poll_stalled(self) -> bool:
         """True when between-turns polling saw no new activity for STALL_TIMEOUT_SEC."""
         current = (len(self.mapper.raw_events), self.client.turn_started_seq(self.thread_id))
@@ -1533,6 +1584,10 @@ class CodexSession:
         if self.pending_failure is not None:
             # Propagate fatal turn failures even if the goal completed.
             raise self.pending_failure
+        # A native continuation can start and end before the status read
+        # (``usageLimited`` is set by its failure): handle that turn first.
+        if await self._adopt_native_turn():
+            return False
         if (
             status in GOAL_SUCCESS_STATUSES
             or self.best_effort_nudged
@@ -1693,6 +1748,11 @@ class CodexSession:
             "goal_ok": self.goal_ok,
             "attempt_count": self.attempt_count,
             "refusal_retries": self.refusal_retries,
+            "elapsed_sec": self.budget.elapsed(),
+            "held_sec": self.budget.held_sec,
+            "delivered_checkpoints": sorted(self.budget.delivered),
+            # A reminder awaiting delivery is delivered after resume.
+            "pending_checkpoint": self.pending_checkpoint,
             "accounting": self.mapper.checkpoint_accounting(),
         }
 

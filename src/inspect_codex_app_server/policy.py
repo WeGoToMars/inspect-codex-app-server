@@ -65,6 +65,10 @@ class RunPolicy:
     Quota management:
     - ``quota_hold_sec``: Max seconds to pause and wait for account rate limits to reset.
       Paused time is credited to Inspect working limits and excluded from the agent timeout.
+
+    ``budget_factory`` builds the run's time budget, called like
+    ``BudgetTracker(timeout_sec, clock=..., checkpoints=checkpoint_fractions)``;
+    a subclass can override ``horizon_sec`` to move checkpoints earlier.
     """
 
     completion: Literal["turn", "goal", "submission"] = "turn"
@@ -83,6 +87,7 @@ class RunPolicy:
     quota_hold_sec: float = 0.0
     quota_poll_sec: float = 60.0
     budget_resumed: Callable[[SandboxEnvironment, BudgetTracker], Awaitable[None]] | None = None
+    budget_factory: Callable[..., BudgetTracker] | None = None
 
     def __post_init__(self) -> None:
         if self.completion not in ("turn", "goal", "submission"):

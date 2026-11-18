@@ -35,7 +35,15 @@ from inspect_ai.util import SandboxEnvironment
 from inspect_codex_app_server import CodexSubagent, codex_agent, compat
 from inspect_codex_app_server.policy import RunPolicy
 
-from .support import ScriptedAppServer, configure_common, patch_session, usage_params
+from .support import (
+    FakeCheckpointer,
+    ScriptedAppServer,
+    configure_common,
+    patch_session,
+    resume_from,
+    usage_params,
+    use_checkpointer,
+)
 
 
 class ApprovingServer(ScriptedAppServer):
@@ -699,6 +707,150 @@ def test_deadline_interrupt_is_not_held_by_a_tool_ignoring_cancellation(tmp_path
     assert released_at_interrupt and not any(released_at_interrupt)
 
 
+def test_deadline_during_a_recovered_turn_is_a_time_limit(tmp_path, monkeypatch):
+    failure = {"httpConnectionFailed": {"httpStatusCode": None}}
+    server = ScriptedModelServer(("fail", failure), ("hang", ""))
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent(timeout_sec=1.0)))
+    assert sample.error is None, "The retried turn was working when time ran out"
+    assert [e.type for e in sample.events if e.event == "sample_limit"] == ["time"]
+    assert len(requests(server, "turn/start")) == 2
+
+
+@pytest.mark.parametrize("action", ["submit", "answer"])
+def test_turn_failing_after_an_accepted_submission_keeps_the_answer(tmp_path, monkeypatch, action):
+    server = ScriptedModelServer((action, "42"))
+    failure = {"message": "stream failed after the answer", "codexErrorInfo": "other"}
+    server.complete = lambda turn, error=None: ScriptedModelServer.complete(server, turn, error=failure)
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent(submit=True)))
+    if action == "answer":  # Without an accepted submission the failure is an execution error.
+        assert sample.error is not None and "stream failed" in sample.error.message
+        return
+    assert sample.error is None
+    assert sample.output.completion == "42"
+    assert "stream failed" in sample.metadata["codex_failure_after_submission"]
+
+
+def test_checkpoint_reminders_follow_the_budget_horizon(tmp_path, monkeypatch):
+    from inspect_codex_app_server.runtime.budget import BudgetTracker
+
+    class EarlierHorizon(BudgetTracker):
+        @property
+        def horizon_sec(self) -> float:
+            return 0.4
+
+    reminders = []
+
+    def message(fraction, elapsed, total):
+        reminders.append((fraction, elapsed, total))
+        return "Wrap up."
+
+    server = ScriptedModelServer(("hang", ""))
+    server.responses["turn/steer"] = {}
+    server.hooks["turn/steer"] = lambda srv, params: srv.play_answer("turn-1", "42")
+    policy = RunPolicy(checkpoint_fractions=(0.5,), checkpoint_message=message, budget_factory=EarlierHorizon)
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent(policy=policy, timeout_sec=60.0)))
+    assert sample.error is None
+    assert sample.output.completion == "42"
+    (fraction, elapsed, total), = reminders
+    assert (fraction, total) == (0.5, 0.4) and 0.2 <= elapsed < 30.0
+    steer, = requests(server, "turn/steer")
+    assert steer["input"][0]["text"] == "Wrap up."
+
+
+@pytest.mark.parametrize("between_turns", [False, True])
+def test_a_horizon_moved_while_waiting_is_picked_up_by_the_next_recheck(tmp_path, monkeypatch, between_turns):
+    """A subclass horizon that shrinks during a turn, or between turns, brings its reminder forward."""
+    import inspect_codex_app_server.session as session_mod
+    from inspect_codex_app_server.runtime.budget import BudgetTracker
+
+    monkeypatch.setattr(session_mod, "CHECKPOINT_RECHECK_SEC", 0.2)
+    moved = {"horizon": None}
+
+    class MovingHorizon(BudgetTracker):
+        @property
+        def horizon_sec(self) -> float:
+            return moved["horizon"] or self.budget_sec
+
+    reminders = []
+
+    def message(fraction, elapsed, total):
+        reminders.append((elapsed, total))
+        return "Wrap up."
+
+    if between_turns:  # The first turn ends at once; the reminder starts the next turn.
+        server = ScriptedModelServer(("answer", "Working on it."), ("submit", "42"))
+    else:  # The turn stays active; the reminder is steered into it.
+        server = ScriptedModelServer(("hang", ""))
+        server.responses["turn/steer"] = {}
+        server.hooks["turn/steer"] = lambda srv, params: srv.play_answer("turn-1", "42")
+    play = server.play
+
+    def start(srv, params):
+        play(srv, params)
+        if srv.turns == 1:  # The horizon shrinks after the run has started waiting.
+            asyncio.get_running_loop().call_later(0.3, moved.update, {"horizon": 0.4})
+
+    server.hooks["turn/start"] = start
+    policy = RunPolicy(checkpoint_fractions=(0.5,), checkpoint_message=message, budget_factory=MovingHorizon)
+    agent = codex_agent(policy=policy, submit=between_turns, timeout_sec=3.0)
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(agent))
+    assert sample.error is None and sample.output.completion == "42"
+    (elapsed, total), = reminders
+    # Without a recheck the reminder waits for the timer set from the old horizon (1.5 s).
+    assert total == 0.4 and elapsed < 1.0
+
+
+def test_a_reminder_due_between_turns_starts_before_the_grace_period_ends(tmp_path, monkeypatch):
+    """An idle active goal waits for its continuation, but not past the next reminder."""
+    server = ScriptedModelServer(("answer", "Working on it."), ("submit", "42"))
+    policy = RunPolicy(checkpoint_fractions=(0.2,), checkpoint_message=lambda f, e, t: "Wrap up.")
+    sample = run_task(tmp_path, monkeypatch, server,
+                      as_solver(codex_agent(policy=policy, submit=True, timeout_sec=1.0)))
+    assert sample.error is None
+    assert sample.output.completion == "42"
+    assert turn_inputs(server)[1] == "Wrap up."
+
+
+def test_a_native_continuation_that_fails_during_the_goal_read_preempts_a_due_reminder(tmp_path, monkeypatch):
+    server = ScriptedModelServer(("submit", "42"))
+    play = server.play
+
+    def start(srv, params):
+        if srv.turns == 1:  # The first turn ends after the 0.1 s reminder is due.
+            asyncio.get_running_loop().call_later(0.2, srv.play_answer, "turn-1", "Working on it.")
+        else:
+            play(srv, params)
+
+    def continuation_fails(srv, params):
+        # Announced, then failed, right after the read replies "active".
+        if len(requests(srv, "thread/goal/get")) == 1:
+            srv.notify("turn/started", {"threadId": "root-thread", "turn": {"id": "native-2", "status": "inProgress"}})
+            srv.complete("native-2", error={"message": "unexpected status 413 Payload Too Large",
+                                            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 413}}})
+
+    server.hooks["turn/start"] = start
+    server.hooks["thread/goal/get"] = continuation_fails
+    policy = RunPolicy(checkpoint_fractions=(0.1,), checkpoint_message=lambda f, e, t: "Wrap up.")
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent(policy=policy, submit=True, timeout_sec=1.0)))
+    assert sample.error is not None and "413" in sample.error.message
+    assert "Wrap up." not in turn_inputs(server)
+
+
+def test_failure_of_a_later_root_turn_after_submission_is_recorded(tmp_path, monkeypatch):
+    server = ScriptedModelServer(("submit", "42"))
+    complete = server.complete
+
+    def submitted_then_failed(turn, error=None):
+        complete(turn, error=error)
+        complete("turn-9", error={"message": "the next turn failed", "codexErrorInfo": "other"})
+
+    server.complete = submitted_then_failed
+    sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent(submit=True)))
+    assert sample.error is None
+    assert sample.output.completion == "42"
+    assert "the next turn failed" in sample.metadata["codex_failure_after_submission"]
+
+
 def test_operator_message_posted_during_a_turn_starts_the_next(tmp_path, monkeypatch):
     server = ScriptedModelServer(("post", "Also show the working."), ("answer", "42"))
     attach_operator(monkeypatch, server)
@@ -776,35 +928,6 @@ def test_subagent_models_are_validated_before_inference(tmp_path, monkeypatch):
     assert not requests(server, "turn/start")
 
 
-class FakeCheckpointer:
-    """The sample's checkpoint session, recording ticks and serving restored values."""
-
-    def __init__(self, attempt: str = "initial", restored: dict | None = None) -> None:
-        self.attempt = attempt
-        self.restored = None
-        self.values = restored or {}
-        self.callbacks: dict = {}
-        self.events: list = []
-
-    def track(self, key, callback, initial_value, *, value_type=None):
-        self.callbacks[key] = callback
-        return self.values.get(key, initial_value)
-
-    async def tick(self) -> None:
-        self.events.append(("tick", json.loads(json.dumps(self.callbacks["codex_session"]()))))
-
-
-def use_checkpointer(monkeypatch, fake, server):
-    import inspect_codex_app_server.compat as compat
-
-    @asynccontextmanager
-    async def session():
-        yield fake
-
-    monkeypatch.setattr(compat, "sample_checkpointer", session)
-    return fake
-
-
 MIRROR = "/home/agent/.codex-inspect-checkpoint"
 
 
@@ -820,7 +943,7 @@ def test_resumed_sample_continues_the_restored_codex_thread(tmp_path, monkeypatc
         play(srv, params)
 
     first.hooks["turn/start"] = first_turn
-    saved = use_checkpointer(monkeypatch, FakeCheckpointer(), first)
+    saved = use_checkpointer(monkeypatch, FakeCheckpointer())
     initial = run_task(tmp_path / "initial", monkeypatch, first, as_solver(codex_agent()))
     assert initial.error is None
     assert ("exec", ["sh", "-c", MIRROR_SESSIONS, "sh", "/isolated-codex-home", MIRROR]) in first.sandbox_calls
@@ -829,6 +952,7 @@ def test_resumed_sample_continues_the_restored_codex_thread(tmp_path, monkeypatc
     tracked = saved.callbacks["messages"]()
     assert "Working on it." in [m.text for m in tracked]
     session["goal_ok"] = True
+    session["elapsed_sec"] = 100.0  # Time the interrupted attempt already used.
     if not accounting_saved:
         del session["accounting"]
 
@@ -841,9 +965,9 @@ def test_resumed_sample_continues_the_restored_codex_thread(tmp_path, monkeypatc
         play_resumed(srv, params)
 
     server.hooks["turn/start"] = resumed_turn
-    use_checkpointer(monkeypatch, FakeCheckpointer("resume", {
+    resumed = use_checkpointer(monkeypatch, FakeCheckpointer("resume", {
         "codex_session": session, "messages": tracked,
-    }), server)
+    }))
 
     @solver
     def restore_inspect_usage():
@@ -874,6 +998,76 @@ def test_resumed_sample_continues_the_restored_codex_thread(tmp_path, monkeypatc
     assert "Working on it." in [m.text for m in sample.messages], "The restored conversation is kept"
     assert sample.metadata["codex_run"]["resumed_thread"] == "root-thread"
     assert "raw_events_unavailable_after_resume" in sample.metadata["codex_unsupported_settings"]
+    # The time budget continues from the interrupted attempt rather than restarting.
+    assert resumed.events[-1][1]["elapsed_sec"] >= 100.0
+
+
+@pytest.mark.parametrize("used", [0.8, 1.0])
+def test_resume_provisions_only_within_the_remaining_budget(tmp_path, monkeypatch, used):
+    first = ScriptedModelServer(("answer", "Working on it."))
+    saved = use_checkpointer(monkeypatch, FakeCheckpointer())
+    assert run_task(tmp_path / "initial", monkeypatch, first, as_solver(codex_agent())).error is None
+
+    prepared = []
+
+    async def slow_prepare(env, state, budget):
+        prepared.append(state.sample_id)
+        await asyncio.sleep(0.4)
+
+    server = ScriptedModelServer(("submit", "42"))
+    resume_from(monkeypatch, saved)["elapsed_sec"] = used
+    agent = codex_agent(policy=RunPolicy(prepare=slow_prepare), submit=True, timeout_sec=1.0)
+    sample = run_task(tmp_path / "resumed", monkeypatch, server, as_solver(agent))
+    if used == 1.0:  # Nothing left: a time limit, and nothing is provisioned.
+        assert sample.error is None and not prepared and not server.requests
+        assert [e.type for e in sample.events if e.event == "sample_limit"] == ["time"]
+    else:  # Setup cannot overrun the 0.2 s that remain.
+        assert sample.error is not None and "setup exceeded the agent deadline" in sample.error.message
+        assert not requests(server, "initialize")
+
+
+@pytest.mark.parametrize("delivered", [True, False], ids=["delivered", "pending"])
+def test_resume_preserves_reminder_delivery(tmp_path, monkeypatch, delivered):
+    from inspect_codex_app_server.runtime.budget import BudgetTracker
+
+    now = 0.0
+
+    def budget_factory(timeout_sec, *, clock, checkpoints):
+        return BudgetTracker(timeout_sec, clock=lambda: now, checkpoints=checkpoints)
+
+    def start_first_turn(server, params):
+        nonlocal now
+        now = 1.25  # Pass the initial 50% milestone before the turn finishes.
+        server.play(server, params)
+
+    first = ScriptedModelServer(("hang", ""))
+    first.hooks["turn/start"] = start_first_turn
+    if delivered:
+        first.responses["turn/steer"] = {}
+    first.hooks["turn/steer"] = lambda srv, params: srv.play_answer("turn-1", "Working on it.")
+    saved = use_checkpointer(monkeypatch, FakeCheckpointer())
+    policy = RunPolicy(checkpoint_fractions=(0.5,), checkpoint_message=lambda *args: "Wrap up.",
+                       budget_factory=budget_factory)
+    initial = run_task(tmp_path / "initial", monkeypatch, first,
+                       as_solver(codex_agent(policy=policy, timeout_sec=2.0)))
+    assert initial.error is None and len(requests(first, "turn/steer")) == 1
+
+    server = ScriptedModelServer(("hang", ""))
+    server.responses["turn/steer"] = {}
+    server.hooks["turn/steer"] = lambda srv, params: srv.play_answer("turn-1", "42")
+    resume_from(monkeypatch, saved)
+    # The clock stays at 1.25 s. The delivered milestone is already due, and
+    # the later horizon keeps the pending case from regenerating its reminder.
+    sample = run_task(tmp_path / "resumed", monkeypatch, server,
+                      as_solver(codex_agent(policy=policy, timeout_sec=2.0 if delivered else 3.0)))
+    assert sample.error is None
+    steers = [params["input"][0]["text"] for params in requests(server, "turn/steer")]
+    if delivered:
+        assert not steers
+        assert [e.type for e in sample.events if e.event == "sample_limit"] == ["time"]
+    else:
+        assert steers == ["Wrap up."]
+        assert sample.output.completion == "42"
 
 
 def test_resume_for_scoring_returns_the_restored_result_without_codex(tmp_path, monkeypatch):
@@ -883,7 +1077,7 @@ def test_resume_for_scoring_returns_the_restored_result_without_codex(tmp_path, 
     use_checkpointer(monkeypatch, FakeCheckpointer("resume_for_scoring", {
         "messages": [ChatMessageUser(content="What is 19 + 23?")],
         "output": ModelOutput.from_content("codex", "42"),
-    }), server)
+    }))
     sample = run_task(tmp_path, monkeypatch, server, as_solver(codex_agent()))
     assert sample.error is None
     assert not server.requests, "Scoring re-runs without starting Codex"

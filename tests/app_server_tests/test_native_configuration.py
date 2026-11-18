@@ -199,3 +199,28 @@ async def test_native_reports_unloadable_skills_failed_mcp_servers_and_retries(e
              if method == "mcpServer/startupStatus/updated" and params["status"] != "starting"}
     assert final == {"ok": "ready", "broken": "failed"}
     assert [params["willRetry"] for method, params in seen if method == "error"] == [True]
+
+
+@pytest.mark.native
+@pytest.mark.parametrize("reply, transient", [("truncated", True), (413, False)])
+async def test_native_turn_failures_are_classified_for_recovery(evaluation_workspace, native_binary, reply, transient):
+    """Codex retries the stream itself, then fails the turn: only transient failures earn another turn."""
+    from inspect_codex_app_server.session import _classify_turn_error
+
+    async def respond(request):
+        if reply == "truncated":
+            return sse({"type": "response.created", "response": {"id": "r"}})  # Closed before completion.
+        return web.Response(status=reply, text="rejected")
+
+    async def body(client, thread_id):
+        turn = await client.rpc.turn_start({"threadId": thread_id, "input": [
+            {"type": "text", "text": "go", "text_elements": []}]})
+        return await client.wait_for_turn(thread_id=thread_id, turn_id=turn["turn"]["id"], timeout=60)
+
+    home = evaluation_workspace / "native-home"
+    home.mkdir()
+    async with responses_peer(respond) as base_url:
+        completed, _ = await session(home, base_url, native_binary, body)
+
+    assert completed["turn"]["status"] == "failed"
+    assert _classify_turn_error(completed["turn"]) == ("turn_failure", transient)

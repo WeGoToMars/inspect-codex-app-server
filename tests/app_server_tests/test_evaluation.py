@@ -18,13 +18,14 @@ from inspect_ai.scorer import match
 
 from inspect_codex_app_server import RunPolicy, codex_app_server
 
-from .support import patch_session
+from .support import FakeCheckpointer, patch_session, resume_from, use_checkpointer
 
 
 class Peer:
-    def __init__(self, account, *, failure=None, switch_account=False, continuation=False):
+    def __init__(self, account, *, failure=None, switch_account=False, continuation=False, continuation_error=None):
         self.account = account
         self.failure = failure
+        self.continuation_error = continuation_error
         self.switch_account = switch_account
         self.continuation = continuation
         self.requests = []
@@ -51,19 +52,22 @@ class Peer:
             "thread/inject_items": {},
             "turn/start": {"turn": {"id": "turn-1"}},
             "thread/goal/set": {"goal": {"status": params.get("status")}},
-            "thread/goal/get": {"goal": {"status": "completed"}},
+            "thread/goal/get": {"goal": {"status": "usageLimited" if self.continuation_error else "completed"}},
+            "account/rateLimits/read": {"ordinaryUsageAllowed": False},
         }
         assert method in responses, f"Unexpected RPC: {method}"
         if method == "thread/goal/get" and self.continuation:
             # The native continuation can start and finish before the pending
             # goal-status reply reaches the client. No client turn was started.
             self.notify("turn/started", {"threadId": "root", "turn": {"id": "turn-2"}})
-            self.notify("item/completed", {
-                "threadId": "root", "turnId": "turn-2",
-                "item": {"type": "agentMessage", "id": "final-2", "phase": "final_answer", "text": "42"},
-            })
+            if not self.continuation_error:
+                self.notify("item/completed", {
+                    "threadId": "root", "turnId": "turn-2",
+                    "item": {"type": "agentMessage", "id": "final-2", "phase": "final_answer", "text": "42"},
+                })
             self.notify("turn/completed", {
-                "threadId": "root", "turn": {"id": "turn-2", "status": "completed"},
+                "threadId": "root", "turn": {"id": "turn-2", "status": "failed" if self.continuation_error else "completed",
+                                             "error": self.continuation_error},
             })
         self.queue.put_nowait(json.dumps({"id": msg["id"], "result": responses[method]}))
         if method == "turn/start":
@@ -95,8 +99,10 @@ class Peer:
 
 
 class Sandbox:
-    async def exec(self, *args, **kwargs):
-        # No native files exist in this protocol-only scenario.
+    async def exec(self, command, **kwargs):
+        # Home lookup and session mirroring succeed in this protocol-only peer.
+        if command[:2] == ["sh", "-c"]:
+            return SimpleNamespace(returncode=0, stdout="/home/agent", stderr="")
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
 
@@ -280,9 +286,20 @@ def test_task_policy_controls_completion_in_saved_log(tmp_path, monkeypatch, com
     assert sample.metadata["codex_goal_status"] == "completed"
 
 
-def test_fast_goal_continuation_preserves_its_completed_answer(tmp_path, monkeypatch):
-    peer = Peer({"type": "chatgpt"}, continuation=True)
-    sample = run_evaluation(tmp_path, monkeypatch, peer, policy=RunPolicy(completion="goal"))
+@pytest.mark.parametrize("quota_exhausted", [False, True])
+def test_fast_goal_continuation_preserves_its_completed_answer(tmp_path, monkeypatch, quota_exhausted):
+    # Codex marks the goal usageLimited when the continuation fails on the usage limit.
+    failure = {"message": "You've hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"}
+    peer = Peer({"type": "chatgpt"}, continuation=True, continuation_error=failure if quota_exhausted else None)
+    sample = run_evaluation(tmp_path, monkeypatch, peer, policy=RunPolicy(
+        completion="goal", quota_hold_sec=0.3, quota_poll_sec=0.1,
+    ))
+    if quota_exhausted:
+        # The continuation's failure gets the quota hold before the run ends as an error.
+        assert sample.error and "did not recover" in sample.error.message
+        hold, = sample.metadata["codex_quota_holds"]
+        assert hold["outcome"] == "exhausted"
+        return
     assert sample.error is None
     assert sample.output.completion == "42"
     assert next(iter(sample.scores.values())).value == "C"
@@ -332,6 +349,7 @@ class QuotaPeer:
             "account/read": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True},
             "model/list": {"data": []},
             "thread/start": {"thread": {"id": "root"}},
+            "thread/resume": {"thread": {"id": "root"}},
             "thread/inject_items": {},
             "turn/start": {"turn": {"id": f"turn-{starts}"}},
             "thread/goal/set": {"goal": {"status": params.get("status")}},
@@ -367,10 +385,12 @@ def test_quota_hold_resumes_when_usage_recovers(tmp_path, monkeypatch, completio
     async def budget_resumed(env, budget):
         resumed.append(budget.held_sec)
 
-    sample = run_evaluation(tmp_path, monkeypatch, peer, policy=RunPolicy(
-        completion=completion, quota_hold_sec=30.0, quota_poll_sec=0.2, continuation="Resume.",
+    policy = RunPolicy(
+        completion=completion, quota_hold_sec=1.0, quota_poll_sec=0.2, continuation="Resume.",
         budget_resumed=budget_resumed,
-    ))
+    )
+    saved = use_checkpointer(monkeypatch, FakeCheckpointer()) if completion == "turn" else None
+    sample = run_evaluation(tmp_path / "initial", monkeypatch, peer, policy=policy)
     assert sample.error is None
     assert sample.output.completion == "42"
     assert next(iter(sample.scores.values())).value == "C"
@@ -389,8 +409,18 @@ def test_quota_hold_resumes_when_usage_recovers(tmp_path, monkeypatch, completio
         # Native continuation owns the resumed turn; the client only reactivates the goal.
         assert len(turn_texts) == 1
         assert ("thread/goal/set", {"threadId": "root", "status": "active"}) in peer.requests
-    else:
-        assert turn_texts[1:] == ["Resume."]
+        return
+    assert turn_texts[1:] == ["Resume."]
+
+    # Recovery on the fourth poll needs 0.8 s. The first hold already used
+    # at least 0.4 s of the shared 1 s allowance.
+    resume_from(monkeypatch, saved)
+    peer = QuotaPeer([{"ordinaryUsageAllowed": False}] * 4 + [{"ordinaryUsageAllowed": True}])
+    sample = run_evaluation(tmp_path / "resumed", monkeypatch, peer, policy=policy)
+    assert sample.error and "[quota]" in sample.error.message
+    resumed_hold, = sample.metadata["codex_quota_holds"]
+    assert resumed_hold["outcome"] == "exhausted"
+    assert hold["held_sec"] + resumed_hold["held_sec"] == pytest.approx(policy.quota_hold_sec, abs=0.1)
 
 
 def test_exhausted_quota_hold_is_an_error_without_retry(tmp_path, monkeypatch):

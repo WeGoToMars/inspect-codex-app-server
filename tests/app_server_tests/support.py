@@ -12,6 +12,7 @@ from aiohttp import web
 from inspect_ai.model import ChatMessageUser, ModelName
 from inspect_ai.solver import TaskState
 
+from inspect_codex_app_server import compat
 from inspect_codex_app_server.client import CodexClient
 from inspect_codex_app_server.container import REQUIRED_CLI_VERSION
 from inspect_codex_app_server.mapping import EventStreamMapper
@@ -41,6 +42,41 @@ def make_mapper(state=None, *, model_name="codex/test") -> EventStreamMapper:
 
 def model_events(events):
     return [e for e in events if getattr(e, "event", None) == "model"]
+
+
+class FakeCheckpointer:
+    """The sample's checkpoint session, recording ticks and serving restored values."""
+
+    def __init__(self, attempt: str = "initial", restored: dict | None = None) -> None:
+        self.attempt = attempt
+        self.restored = None
+        self.values = restored or {}
+        self.callbacks: dict = {}
+        self.events: list = []
+
+    def track(self, key, callback, initial_value, *, value_type=None):
+        self.callbacks[key] = callback
+        return self.values.get(key, initial_value)
+
+    async def tick(self) -> None:
+        self.events.append(("tick", json.loads(json.dumps(self.callbacks["codex_session"]()))))
+
+
+def use_checkpointer(monkeypatch, fake):
+    @asynccontextmanager
+    async def session():
+        yield fake
+
+    monkeypatch.setattr(compat, "sample_checkpointer", session)
+    return fake
+
+
+def resume_from(monkeypatch, saved):
+    session = saved.events[-1][1]
+    use_checkpointer(monkeypatch, FakeCheckpointer("resume", {
+        "codex_session": session, "messages": saved.callbacks["messages"](),
+    }))
+    return session
 
 
 class LocalExecProcess:

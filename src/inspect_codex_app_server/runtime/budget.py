@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from inspect_ai.event import SampleLimitEvent
 
@@ -18,11 +18,31 @@ class BudgetTracker:
         self.held_sec = 0.0
         self._delivered: set[float] = set()
 
+    def restore(self, elapsed_sec: float = 0.0, held_sec: float = 0.0, delivered: Iterable[float] = ()) -> None:
+        """Continue an interrupted attempt: its working time, quota holds, and delivered reminders."""
+        self.credit(-elapsed_sec)
+        self.held_sec = held_sec
+        self._delivered.update(delivered)
+
+    @property
+    def delivered(self) -> frozenset[float]:
+        """Checkpoint fractions already returned by ``due_checkpoints``."""
+        return frozenset(self._delivered)
+
     def elapsed(self) -> float:
         return self._clock() - self.start
 
     def remaining(self) -> float:
         return self.budget_sec - self.elapsed()
+
+    @property
+    def horizon_sec(self) -> float:
+        """Seconds that checkpoint fractions measure; the hard deadline stays ``budget_sec``.
+
+        Subclasses (see ``RunPolicy.budget_factory``) may shorten it, for example
+        to a projected time at which another budget runs out.
+        """
+        return self.budget_sec
 
     def credit(self, seconds: float) -> None:
         """Exclude time the agent was not working (e.g. awaiting an operator) from the budget."""
@@ -38,14 +58,14 @@ class BudgetTracker:
         due = [
             f
             for f in self.checkpoints
-            if f not in self._delivered and self.elapsed() >= f * self.budget_sec
+            if f not in self._delivered and self.elapsed() >= f * self.horizon_sec
         ]
         self._delivered.update(due)
         return due
 
     def until_next_checkpoint(self) -> float:
         """Seconds until the next due checkpoint or remaining budget."""
-        pending = [f * self.budget_sec - self.elapsed() for f in self.checkpoints if f not in self._delivered]
+        pending = [f * self.horizon_sec - self.elapsed() for f in self.checkpoints if f not in self._delivered]
         return max(0, min(pending)) if pending else max(0, self.remaining())
 
 
